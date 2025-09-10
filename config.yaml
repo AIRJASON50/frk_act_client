@@ -1,0 +1,20 @@
+# ACT客户端配置文件
+server:
+  url: "ws://10.16.49.124:8765"
+  timeout: 10.0
+  max_retries: 3
+
+simulation:
+  task_name: "sim_transfer_cube_scripted"
+  max_timesteps: 400
+  render: true
+
+buffer:
+  max_size: 200
+  request_threshold: 10
+  adaptive: true
+
+camera:
+  image_quality: 90
+  resize_width: 320
+  resize_height: 240

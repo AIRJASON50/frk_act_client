@@ -5,7 +5,18 @@ ACT分布式推理客户端
 """
 
 import sys
-sys.path.append('/home/jason/ws/catkin_ws/src/openRes/demonstration/act1/act')
+import os
+
+# 修复硬编码路径问题 - 使用相对路径和环境变量配置
+current_dir = os.path.dirname(os.path.abspath(__file__))
+act_path = os.getenv('ACT_CLIENT_PATH', os.path.join(current_dir, '..', '..', 'openRes', 'demonstration', 'act1', 'act'))
+if os.path.exists(act_path):
+    sys.path.append(act_path)
+else:
+    # 备用路径
+    backup_path = '/home/jason/ws/catkin_ws/src/openRes/demonstration/act1/act'
+    if os.path.exists(backup_path):
+        sys.path.append(backup_path)
 
 import asyncio
 import websockets
@@ -55,10 +66,12 @@ class SimulationClient:
         
         # 设置日志
         logging.basicConfig(
-            level=logging.DEBUG,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            level=logging.DEBUG,  # 临时调试级别
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            force=True  # 强制重新配置日志
         )
         self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(logging.DEBUG)
         
         # 创建仿真环境
         self.env = None
@@ -124,7 +137,7 @@ class SimulationClient:
             return None
     
     def prepare_request(self, obs):
-        """准备推理请求数据"""
+        """准备推理请求数据 - 符合服务器协议格式"""
         try:
             # 打印观测结构以调试
             self.logger.debug(f"Observation type: {type(obs)}")
@@ -138,9 +151,19 @@ class SimulationClient:
                 # 直接返回观察字典
                 observation = obs
             
-            # 提取机器人状态
+            # 提取机器人状态 - 确保14维关节位置
             qpos = observation['qpos']  # 关节位置
-            qvel = observation['qvel']  # 关节速度
+            
+            # 确保关节位置为14维 (双臂机器人配置)
+            if len(qpos) > 14:
+                joint_positions = qpos[:14].tolist()  # 只取前14个关节
+            else:
+                joint_positions = qpos.tolist()
+                # 如果不足14维，补零到14维
+                while len(joint_positions) < 14:
+                    joint_positions.append(0.0)
+            
+            self.logger.debug(f"Joint positions (14-dim): {joint_positions}")
             
             # 提取图像
             camera_image = None
@@ -148,19 +171,24 @@ class SimulationClient:
                 camera_name = self.camera_names[0]
                 if camera_name in observation['images']:
                     image = observation['images'][camera_name]
-                    camera_image = self.encode_image(image)
+                    camera_image = self.encode_image(image, quality=90)  # 使用更高质量
             
-            # 构造请求
+            # 构造标准请求格式 - 严格符合服务器协议
             self.sequence_id += 1
             request = {
-                'timestamp': time.time(),
-                'sequence_id': self.sequence_id,
-                'robot_state': {
-                    'joint_positions': qpos.tolist(),
-                    'joint_velocities': qvel.tolist()
+                "robot_state": {
+                    "joint_positions": joint_positions
                 },
-                'camera_image': camera_image
+                "camera_image": camera_image,
+                "sequence_id": self.sequence_id
             }
+            
+            # 添加调试输出来检查请求格式
+            self.logger.debug(f"请求格式检查:")
+            self.logger.debug(f"  - robot_state.joint_positions: {len(joint_positions)}维")
+            self.logger.debug(f"  - camera_image: {'有' if camera_image else '无'}")
+            self.logger.debug(f"  - sequence_id: {self.sequence_id}")
+            self.logger.debug(f"  - 请求字段: {list(request.keys())}")
             
             return request
             
@@ -192,6 +220,19 @@ class SimulationClient:
     def process_response(self, response_data):
         """处理服务器响应"""
         try:
+            # 调试输出响应数据结构
+            self.logger.debug(f"收到响应数据类型: {type(response_data)}")
+            self.logger.debug(f"响应数据键: {list(response_data.keys()) if isinstance(response_data, dict) else 'Not a dict'}")
+            
+            # 检查必需字段
+            if 'sequence_id' not in response_data:
+                self.logger.error(f"响应缺少sequence_id字段: {response_data}")
+                return False
+                
+            if 'actions' not in response_data:
+                self.logger.error(f"响应缺少actions字段: {response_data}")
+                return False
+            
             sequence_id = response_data['sequence_id']
             actions = np.array(response_data['actions'])
             
@@ -217,8 +258,71 @@ class SimulationClient:
             
             return True
             
+        except KeyError as e:
+            self.logger.error(f"响应数据缺少必需字段 {e}: {response_data}")
+            return False
         except Exception as e:
-            self.logger.error(f"Failed to process response: {e}")
+            self.logger.error(f"处理响应时发生错误: {e}")
+            self.logger.error(f"响应数据: {response_data}")
+            return False
+    
+    def handle_server_message(self, response_data):
+        """处理不同类型的服务器消息"""
+        try:
+            # 调试输出原始消息
+            self.logger.debug(f"收到服务器消息: {response_data}")
+            
+            # 检查消息是否为空或无效
+            if not response_data or not isinstance(response_data, dict):
+                self.logger.error(f"❌ 服务器错误: 未知消息类型: {response_data}")
+                return False
+            
+            message_type = response_data.get('type', None)
+            
+            # 如果没有type字段，检查是否为动作响应
+            if message_type is None:
+                if 'sequence_id' in response_data and 'actions' in response_data:
+                    self.logger.info("📥 接收到动作响应（无type字段）")
+                    return self.process_response(response_data)
+                elif 'success' in response_data and response_data.get('success') is False:
+                    # 错误响应格式
+                    error_msg = response_data.get('error', '未知错误')
+                    self.logger.error(f"❌ 服务器错误: {error_msg}")
+                    return False
+                else:
+                    self.logger.warning(f"⚠️ 未知消息格式，尝试处理: {response_data}")
+                    return True
+            
+            if message_type == 'connection_established':
+                # 处理连接欢迎消息
+                self.logger.info(f"✅ 服务器连接成功: {response_data.get('message', '连接已建立')}")
+                if 'client_id' in response_data:
+                    self.logger.info(f"🆔 客户端ID: {response_data['client_id']}")
+                if 'server_info' in response_data:
+                    info = response_data['server_info']
+                    self.logger.info(f"🎯 任务: {info.get('task_name', 'unknown')}")
+                    self.logger.info(f"🤖 模型: {info.get('policy_class', 'unknown')}")
+                    self.logger.info(f"📷 相机: {info.get('camera_names', ['unknown'])}")
+                return True
+                
+            elif message_type == 'error':
+                # 处理错误消息
+                error_msg = response_data.get('message', response_data.get('error', '未知错误'))
+                self.logger.error(f"❌ 服务器错误: {error_msg}")
+                return False
+                
+            elif message_type == 'action_response' or ('sequence_id' in response_data and 'actions' in response_data):
+                # 处理动作响应消息
+                return self.process_response(response_data)
+                
+            else:
+                # 未知消息类型
+                self.logger.warning(f"⚠️ 未知消息类型: {message_type}, 消息内容: {response_data}")
+                return True
+                    
+        except Exception as e:
+            self.logger.error(f"处理服务器消息时发生错误: {e}")
+            self.logger.error(f"消息内容: {response_data}")
             return False
     
     async def run_episode(self, websocket):
@@ -238,16 +342,34 @@ class SimulationClient:
             while len(self.action_buffer) == 0:
                 try:
                     response = await asyncio.wait_for(websocket.recv(), timeout=10.0)
-                    response_data = json.loads(response)
+                    self.logger.debug(f"原始服务器响应: {response}")
+                    self.logger.debug(f"响应类型: {type(response)}")
+                    
+                    # 尝试解析JSON
+                    try:
+                        response_data = json.loads(response)
+                        self.logger.info(f"✅ 解析后的响应数据: {response_data}")
+                        self.logger.info(f"响应数据类型: {type(response_data)}")
+                        if isinstance(response_data, dict):
+                            self.logger.info(f"响应字段: {list(response_data.keys())}")
+                    except json.JSONDecodeError as e:
+                        self.logger.error(f"JSON解析失败: {e}")
+                        self.logger.error(f"原始响应内容: {repr(response)}")
+                        continue
                     
                     if 'error' in response_data:
                         self.logger.error(f"Server error: {response_data['error']}")
                         return False
                     
-                    self.process_response(response_data)
+                    success = self.handle_server_message(response_data)
+                    if not success:
+                        self.logger.warning("消息处理失败，继续等待...")
                     
                 except asyncio.TimeoutError:
                     self.logger.error("Timeout waiting for initial actions")
+                    return False
+                except Exception as e:
+                    self.logger.error(f"接收消息时发生错误: {e}")
                     return False
             
             # 运行episode
@@ -263,8 +385,8 @@ class SimulationClient:
                     
                     if 'error' in response_data:
                         self.logger.warning(f"Server error: {response_data['error']}")
-                    else:
-                        self.process_response(response_data)
+                    if len(response_data) > 0:
+                        self.handle_server_message(response_data)
                         
                 except asyncio.TimeoutError:
                     pass  # 没有新消息，继续执行
